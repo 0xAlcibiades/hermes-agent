@@ -3170,6 +3170,25 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
                     async_kwargs["default_headers"] = dict(_ph_async.default_headers)
         except Exception:
             pass
+    # Pin the pool idle-recycle timer below the inference supervisor's 120s
+    # server keep-alive (commensurate, 30s margin). httpx's default
+    # keepalive_expiry is 5s, which collides with a 5s server timeout: an idle
+    # cached client (between aux calls / Slack turns) reuses a socket the server
+    # FIN'd at the same instant -> "Connection error" (the title-generation
+    # failures). DefaultAsyncHttpxClient keeps the OpenAI SDK's own defaults
+    # (timeout, follow_redirects, trust_env proxy resolution) and only overrides
+    # the pool limits, so proxied providers reached through this builder are
+    # unaffected.
+    if "http_client" not in async_kwargs:
+        try:
+            import httpx as _httpx
+            from openai import DefaultAsyncHttpxClient
+
+            async_kwargs["http_client"] = DefaultAsyncHttpxClient(
+                limits=_httpx.Limits(max_keepalive_connections=20, keepalive_expiry=90.0),
+            )
+        except Exception:
+            pass
     return AsyncOpenAI(**async_kwargs), model
 
 

@@ -2970,6 +2970,16 @@ class AIAgent:
             return _httpx.Client(
                 transport=_httpx.HTTPTransport(socket_options=_sock_opts),
                 proxy=_proxy,
+                # Pool idle-recycle timer. httpx's default keepalive_expiry is
+                # 5s, which collides with a 5s server keep-alive timeout: an idle
+                # connection (between tool calls within a turn, or between turns)
+                # gets reused at the same instant the server closes it -> reuse of
+                # a FIN'd socket -> "Connection error". Recycle at 90s, kept below
+                # the inference supervisor's 120s timeout_keep_alive so the client
+                # always lets go of a connection before the server would close it
+                # (commensurate, 30s margin). TCP keepalive above reaps genuinely
+                # dead peers independently.
+                limits=_httpx.Limits(max_keepalive_connections=20, keepalive_expiry=90.0),
             )
         except Exception:
             return None
