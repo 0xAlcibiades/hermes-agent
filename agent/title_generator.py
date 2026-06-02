@@ -22,6 +22,8 @@ TitleCallback = Callable[[str], None]
 _TITLE_PROMPT = (
     "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
     "following exchange. The title should capture the main topic or intent. "
+    "If it is not obvious how to name the session, 'Nondescript Session' is acceptable — "
+    "do not deliberate; answer immediately. "
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
 
