@@ -4398,6 +4398,24 @@ def _compat_model(client: Any, model: Optional[str], cached_default: Optional[st
     return model or cached_default
 
 
+def _thread_is_alive(ident: Any) -> bool:
+    """True iff a thread with this ident is currently running.
+
+    Used to isolate the *synchronous* client cache across threads. A sync
+    ``httpx.Client`` connection pool is NOT safe for concurrent use from
+    multiple threads; the only sync aux caller that runs off the main thread is
+    the fire-and-forget title-gen background thread, and when two overlap they
+    corrupt the shared pool ("Connection error"). When the cached sync client is
+    owned by a *different, still-alive* thread we hand the caller its own client
+    instead of sharing the pool. Conservative on error (assume alive -> isolate).
+    """
+    try:
+        import threading as _t
+        return any(t.ident == ident for t in _t.enumerate())
+    except Exception:
+        return True
+
+
 def _get_cached_client(
     provider: str,
     model: str = None,
@@ -4435,6 +4453,11 @@ def _get_cached_client(
             current_loop = _aio.get_event_loop()
         except RuntimeError:
             pass
+    # For sync clients we isolate by *thread* (the sync httpx pool is not safe
+    # for concurrent cross-thread use) the way async clients isolate by loop.
+    import threading as _threading
+    _current_thread = _threading.get_ident()
+    skip_cache = False
     runtime = _normalize_main_runtime(main_runtime)
     cache_key = _client_cache_key(
         provider,
@@ -4464,8 +4487,30 @@ def _get_cached_client(
                 _force_close_async_httpx(cached_client)
                 del _client_cache[cache_key]
             else:
-                effective = _compat_model(cached_client, model, cached_default)
-                return cached_client, effective
+                # Sync client. The 3rd slot holds the OWNER THREAD id for sync
+                # entries (None for legacy entries -> reuse as before). If a
+                # different, still-alive thread owns this client, do NOT share
+                # its (thread-unsafe) pool — fall through and build an isolated,
+                # uncached client for this thread. Same-thread or dead-owner
+                # reuse stays unchanged (CLI, sequential aux).
+                cached_thread = cached_loop
+                if (
+                    cached_thread is not None
+                    and cached_thread != _current_thread
+                    and _thread_is_alive(cached_thread)
+                ):
+                    skip_cache = True
+                else:
+                    # Reuse (same thread, or the original owner thread is gone).
+                    # Claim ownership for THIS thread while we still hold the
+                    # cache lock, so a later *overlapping* thread sees a live
+                    # foreign owner and isolates instead of sharing the pool.
+                    if cached_thread != _current_thread:
+                        _client_cache[cache_key] = (
+                            cached_client, cached_default, _current_thread,
+                        )
+                    effective = _compat_model(cached_client, model, cached_default)
+                    return cached_client, effective
     # Build outside the lock.
     # For pool-backed api_key providers, derive the active API key from the
     # pool entry rather than from env vars.  resolve_api_key_provider_credentials
@@ -4489,10 +4534,10 @@ def _get_cached_client(
         main_runtime=runtime,
         is_vision=is_vision,
     )
-    if client is not None:
-        # For async clients, remember which loop they were created on so we
-        # can detect stale entries later.
-        bound_loop = current_loop
+    if client is not None and not skip_cache:
+        # Remember the binding so stale/foreign entries are detected on later
+        # hits: the event loop for async clients, the owner thread id for sync.
+        bound = current_loop if async_mode else _current_thread
         with _client_cache_lock:
             if cache_key not in _client_cache:
                 # Safety belt: if the cache has grown beyond the max, evict
@@ -4501,7 +4546,7 @@ def _get_cached_client(
                     evict_key, evict_entry = next(iter(_client_cache.items()))
                     _force_close_async_httpx(evict_entry[0])
                     del _client_cache[evict_key]
-                _client_cache[cache_key] = (client, default_model, bound_loop)
+                _client_cache[cache_key] = (client, default_model, bound)
             else:
                 client, default_model, _ = _client_cache[cache_key]
     return client, model or default_model
